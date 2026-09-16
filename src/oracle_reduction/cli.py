@@ -113,3 +113,35 @@ def list_canonicals(ctx: click.Context) -> None:
         return
     for img in canonicals:
         click.echo(f"  [{img.id}] {img.filename}  {img.width}x{img.height}  ({img.format})")
+
+
+@cli.command()
+@click.pass_context
+def audit(ctx: click.Context) -> None:
+    """Report orphaned files and records whose image file is missing."""
+    store: ImageStore = ctx.obj["store"]
+    result = store.audit_storage()
+    orphans = result["orphan_files"]
+    dangling = result["missing_files"]
+
+    if orphans:
+        click.echo(f"{len(orphans)} orphaned file(s) (on disk but not in DB):")
+        for path in orphans:
+            click.echo(f"  {path}")
+    if dangling:
+        click.echo(f"{len(dangling)} dangling record(s) (in DB but file missing):")
+        for kind, record_id, path in dangling:
+            click.echo(f"  {kind} id={record_id}: {path}")
+    if not orphans and not dangling:
+        click.echo("Image storage is clean.")
+
+
+@cli.command()
+@click.pass_context
+def cleanup(ctx: click.Context) -> None:
+    """Delete orphaned files and records whose image file is missing."""
+    store: ImageStore = ctx.obj["store"]
+    orphan_count = store.cleanup_orphans()
+    dangling_count = store.remove_dangling_records()
+    click.echo(f"Removed {orphan_count} orphaned file(s).")
+    click.echo(f"Removed {dangling_count} dangling DB record(s).")

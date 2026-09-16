@@ -222,6 +222,95 @@ class ImageStore:
         return cursor.lastrowid  # type: ignore[return-value]
 
     # ------------------------------------------------------------------
+    # Integrity
+    # ------------------------------------------------------------------
+
+    def audit_storage(self) -> dict[str, list]:
+        """Report mismatches between managed files on disk and database rows.
+
+        Returns:
+            A dict with two keys:
+
+            ``orphan_files``
+                ``[Path, ...]`` — files under ``storage_dir`` that no row
+                references.
+            ``missing_files``
+                ``[(kind, row_id, Path), ...]`` — rows whose ``file_path`` is
+                absent from disk, where *kind* is ``"canonical"`` or
+                ``"variant"``.
+        """
+        referenced: set[Path] = set()
+        missing_files: list[tuple[str, int, Path]] = []
+
+        for kind, row_id, path in self._iter_referenced():
+            referenced.add(path.resolve())
+            if not path.exists():
+                missing_files.append((kind, row_id, path))
+
+        orphan_files = [
+            path
+            for directory in (self._canonicals_dir, self._variants_dir)
+            for path in sorted(directory.iterdir())
+            if path.is_file() and path.resolve() not in referenced
+        ]
+
+        return {"orphan_files": orphan_files, "missing_files": missing_files}
+
+    def cleanup_orphans(self) -> int:
+        """Delete managed files that no database row references.
+
+        Returns:
+            The number of files removed.
+        """
+        removed = 0
+        for path in self.audit_storage()["orphan_files"]:
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            removed += 1
+        return removed
+
+    def remove_dangling_records(self) -> int:
+        """Delete rows whose managed file is missing from disk.
+
+        Variants of a removed canonical are deleted as well, so no variant is
+        left pointing at a canonical that no longer exists.  ``ON DELETE
+        CASCADE`` does not fire here because SQLite enforces foreign keys only
+        under ``PRAGMA foreign_keys = ON``, so the cascade is done explicitly.
+        Any still-present files belonging to those variants become orphans,
+        which :meth:`cleanup_orphans` then removes.
+
+        Returns:
+            The number of rows removed.
+        """
+        missing = self.audit_storage()["missing_files"]
+        canonical_ids = [row_id for kind, row_id, _ in missing if kind == "canonical"]
+        variant_ids = [row_id for kind, row_id, _ in missing if kind == "variant"]
+
+        removed = 0
+        for row_id in variant_ids:
+            removed += self._conn.execute(
+                "DELETE FROM image_variants WHERE id = ?", (row_id,)
+            ).rowcount
+        for row_id in canonical_ids:
+            removed += self._conn.execute(
+                "DELETE FROM image_variants WHERE canonical_id = ?", (row_id,)
+            ).rowcount
+            removed += self._conn.execute(
+                "DELETE FROM images WHERE id = ?", (row_id,)
+            ).rowcount
+
+        self._conn.commit()
+        return removed
+
+    def _iter_referenced(self):
+        """Yield ``(kind, row_id, file_path)`` for every row in both tables."""
+        for kind, table in (("canonical", "images"), ("variant", "image_variants")):
+            for row in self._conn.execute(f"SELECT id, file_path FROM {table}"):
+                yield kind, row["id"], Path(row["file_path"])
+
+    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
