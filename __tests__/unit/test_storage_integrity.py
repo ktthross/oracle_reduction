@@ -202,3 +202,51 @@ class TestRemoveDanglingRecords:
         result = store.audit_storage()
         assert result["orphan_files"] == []
         assert result["missing_files"] == []
+
+
+# ---------------------------------------------------------------------------
+# The cached pHash index must never go stale
+# ---------------------------------------------------------------------------
+
+
+class TestPHashIndexCache:
+    def test_index_starts_from_what_is_already_stored(self, store: ImageStore, tmp_path: Path):
+        add_canonical(store, tmp_path, "a.png")
+        assert len(store.canonical_phash_index()) == 1
+
+    def test_saving_a_canonical_updates_a_live_index(self, store: ImageStore, tmp_path: Path):
+        store.canonical_phash_index()  # build it first, so the add must patch it
+        add_canonical(store, tmp_path, "a.png")
+        assert len(store.canonical_phash_index()) == 1
+
+    def test_a_new_canonical_is_immediately_findable(self, store: ImageStore, tmp_path: Path):
+        store.canonical_phash_index()
+        canonical_id = add_canonical(store, tmp_path, "a.png")
+
+        stored_phash = compute_phash(make_gradient(64, 64))
+        assert store.canonical_phash_index().nearest(stored_phash) == (canonical_id, 0)
+
+    def test_deleting_a_canonical_drops_it_from_the_index(
+        self, store: ImageStore, tmp_path: Path
+    ):
+        """A stale index would keep matching images that no longer exist."""
+        canonical_id = add_canonical(store, tmp_path, "a.png")
+        store.get_canonical(canonical_id).file_path.unlink()
+        store.canonical_phash_index()  # warm the cache before deleting
+
+        store.remove_dangling_records()
+
+        assert len(store.canonical_phash_index()) == 0
+
+    def test_index_survives_a_cleanup_that_removes_nothing(
+        self, store: ImageStore, tmp_path: Path
+    ):
+        add_canonical(store, tmp_path, "a.png")
+        store.canonical_phash_index()
+        store.remove_dangling_records()
+        assert len(store.canonical_phash_index()) == 1
+
+    def test_index_agrees_with_the_table(self, store: ImageStore, tmp_path: Path):
+        add_canonical(store, tmp_path, "a.png")
+        add_canonical(store, tmp_path, "b.png", tint=120)
+        assert len(store.canonical_phash_index()) == len(store.get_all_canonical_phashes())
