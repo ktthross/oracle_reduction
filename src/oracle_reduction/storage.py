@@ -17,6 +17,7 @@ from pathlib import Path
 import imagehash
 from PIL import Image
 
+from .comparator import PHashIndex
 from .models import ImageRecord, VariantRecord
 
 _DDL = """
@@ -89,6 +90,7 @@ class ImageStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_DDL)
         self._conn.commit()
+        self._phash_index: PHashIndex | None = None
 
     # ------------------------------------------------------------------
     # Lookups
@@ -110,6 +112,21 @@ class ImageStore:
         """Return ``[(id, phash_str), ...]`` for every canonical image."""
         rows = self._conn.execute("SELECT id, phash FROM images").fetchall()
         return [(row["id"], row["phash"]) for row in rows]
+
+    def canonical_phash_index(self) -> PHashIndex:
+        """Return the pHash index, building it from the database on first use.
+
+        Kept in memory and appended to by :meth:`save_canonical`, so a scan
+        reads the table once instead of once per image.  Anything that deletes
+        canonicals must call :meth:`invalidate_phash_index`.
+        """
+        if self._phash_index is None:
+            self._phash_index = PHashIndex.from_pairs(self.get_all_canonical_phashes())
+        return self._phash_index
+
+    def invalidate_phash_index(self) -> None:
+        """Drop the cached index so the next lookup rebuilds it."""
+        self._phash_index = None
 
     def get_canonical(self, canonical_id: int) -> ImageRecord | None:
         """Fetch a canonical image record by primary key."""
@@ -170,7 +187,11 @@ class ImageStore:
             ),
         )
         self._conn.commit()
-        return cursor.lastrowid  # type: ignore[return-value]
+
+        canonical_id = cursor.lastrowid
+        if self._phash_index is not None:
+            self._phash_index.add(canonical_id, phash)
+        return canonical_id  # type: ignore[return-value]
 
     def save_variant(
         self,
@@ -322,6 +343,8 @@ class ImageStore:
             ).rowcount
 
         self._conn.commit()
+        if removed:
+            self.invalidate_phash_index()
         return removed
 
     def _iter_referenced(self):
