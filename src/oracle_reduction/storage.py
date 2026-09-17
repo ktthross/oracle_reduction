@@ -9,6 +9,7 @@ File layout under *storage_dir*::
 
 from __future__ import annotations
 
+import os
 import shutil
 import sqlite3
 from pathlib import Path
@@ -61,11 +62,25 @@ class ImageStore:
     Args:
         db_path: Path to the SQLite database file (created if absent).
         storage_dir: Root directory for managed image files (created if absent).
+        store_mode: ``"copy"`` duplicates each incoming file into the store, so
+            the store keeps working when the original is deleted.
+            ``"symlink"`` links to the original instead: near-zero disk, but an
+            entry breaks if its source is moved or removed.  Cleanup only ever
+            unlinks entries inside ``storage_dir``, so source files are never
+            deleted in either mode.
     """
 
-    def __init__(self, db_path: str | Path, storage_dir: str | Path) -> None:
+    def __init__(
+        self,
+        db_path: str | Path,
+        storage_dir: str | Path,
+        store_mode: str = "copy",
+    ) -> None:
+        if store_mode not in ("copy", "symlink"):
+            raise ValueError(f"store_mode must be 'copy' or 'symlink', got {store_mode!r}")
         self.db_path = Path(db_path)
         self.storage_dir = Path(storage_dir)
+        self.store_mode = store_mode
         self._canonicals_dir = self.storage_dir / "canonicals"
         self._variants_dir = self.storage_dir / "variants"
         self._canonicals_dir.mkdir(parents=True, exist_ok=True)
@@ -132,7 +147,7 @@ class ImageStore:
             The new row's primary key.
         """
         dest = self._unique_dest(self._canonicals_dir, source_path, crypto_hash)
-        shutil.copy2(source_path, dest)
+        self._place(source_path, dest)
 
         width, height = image.size
         fmt = image.format or source_path.suffix.lstrip(".").upper() or "UNKNOWN"
@@ -180,7 +195,7 @@ class ImageStore:
             The new row's primary key.
         """
         dest = self._unique_dest(self._variants_dir, source_path, crypto_hash)
-        shutil.copy2(source_path, dest)
+        self._place(source_path, dest)
 
         width, height = image.size
         fmt = image.format or source_path.suffix.lstrip(".").upper() or "UNKNOWN"
@@ -243,7 +258,9 @@ class ImageStore:
         missing_files: list[tuple[str, int, Path]] = []
 
         for kind, row_id, path in self._iter_referenced():
-            referenced.add(path.resolve())
+            referenced.add(self._entry_key(path))
+            # exists() follows symlinks, so a link whose target is gone counts
+            # as missing — which is what a broken entry means for the gallery.
             if not path.exists():
                 missing_files.append((kind, row_id, path))
 
@@ -251,7 +268,10 @@ class ImageStore:
             path
             for directory in (self._canonicals_dir, self._variants_dir)
             for path in sorted(directory.iterdir())
-            if path.is_file() and path.resolve() not in referenced
+            # is_symlink() catches broken links, which is_file() reports as
+            # False; without it a dead link would never be swept up.
+            if (path.is_file() or path.is_symlink())
+            and self._entry_key(path) not in referenced
         ]
 
         return {"orphan_files": orphan_files, "missing_files": missing_files}
@@ -327,6 +347,24 @@ class ImageStore:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _place(self, source: Path, dest: Path) -> None:
+        """Put *source* into the store at *dest*, honouring ``store_mode``."""
+        if self.store_mode == "symlink":
+            # Absolute, so the link resolves no matter the working directory.
+            os.symlink(Path(source).resolve(), dest)
+        else:
+            shutil.copy2(source, dest)
+
+    @staticmethod
+    def _entry_key(path: Path) -> Path:
+        """Identity of a store entry, for comparing disk against database.
+
+        Uses ``abspath`` rather than ``resolve``: in symlink mode the entry is
+        the link itself, and resolving would compare the targets instead, so a
+        broken link would stop matching its own row.
+        """
+        return Path(os.path.abspath(path))
 
     @staticmethod
     def _unique_dest(directory: Path, source: Path, crypto_hash: str) -> Path:

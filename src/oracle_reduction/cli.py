@@ -25,8 +25,14 @@ from .storage import ImageStore
     envvar="ORACLE_STORAGE_DIR",
     help="Root directory for managed image files (default: image_store).",
 )
+@click.option(
+    "--link",
+    is_flag=True,
+    default=False,
+    help="Symlink stored images to their originals instead of copying them.",
+)
 @click.pass_context
-def cli(ctx: click.Context, db: str | None, storage_dir: str | None) -> None:
+def cli(ctx: click.Context, db: str | None, storage_dir: str | None, link: bool) -> None:
     """Oracle Reduction — image deduplication and variant detection."""
     ctx.ensure_object(dict)
     config = Config()
@@ -34,8 +40,12 @@ def cli(ctx: click.Context, db: str | None, storage_dir: str | None) -> None:
         config.db_path = db
     if storage_dir:
         config.storage_dir = storage_dir
+    if link:
+        config.store_mode = "symlink"
     ctx.obj["config"] = config
-    ctx.obj["store"] = ImageStore(config.db_path, config.storage_dir)
+    ctx.obj["store"] = ImageStore(
+        config.db_path, config.storage_dir, store_mode=config.store_mode
+    )
 
 
 @cli.command()
