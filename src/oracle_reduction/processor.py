@@ -56,12 +56,11 @@ class ImageProcessor:
             phash = compute_phash(img)
 
             crypto_exists = self.store.crypto_hash_exists(crypto_hash)
-            stored_phashes = self.store.get_all_canonical_phashes()
 
             result = compare(
                 crypto_hash=crypto_hash,
                 phash=phash,
-                stored_phashes=stored_phashes,
+                stored_phashes=self.store.canonical_phash_index(),
                 crypto_exists=crypto_exists,
                 threshold=threshold,
             )
