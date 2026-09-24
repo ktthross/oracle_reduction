@@ -18,6 +18,7 @@ import imagehash
 from PIL import Image
 
 from .comparator import PHashIndex
+from .hasher import phash_from_str
 from .models import ImageRecord, VariantRecord
 
 _DDL = """
@@ -134,6 +135,17 @@ class ImageStore:
             "SELECT * FROM images WHERE id = ?", (canonical_id,)
         ).fetchone()
         return self._to_image_record(row) if row else None
+
+    def get_variant(self, variant_id: int) -> VariantRecord | None:
+        """Fetch a variant record by primary key.
+
+        Variants were previously reachable only through their canonical, which
+        is no help to a caller acting on one variant it already has the id of.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM image_variants WHERE id = ?", (variant_id,)
+        ).fetchone()
+        return self._to_variant_record(row) if row else None
 
     def get_variants_for_canonical(self, canonical_id: int) -> list[VariantRecord]:
         """Return all variant records linked to *canonical_id*."""
@@ -352,6 +364,143 @@ class ImageStore:
         for kind, table in (("canonical", "images"), ("variant", "image_variants")):
             for row in self._conn.execute(f"SELECT id, file_path FROM {table}"):
                 yield kind, row["id"], Path(row["file_path"])
+
+    # ------------------------------------------------------------------
+    # Deletion and reclassification
+    # ------------------------------------------------------------------
+
+    def delete_variant(self, variant_id: int) -> VariantRecord | None:
+        """Delete a variant's row and unlink its managed file.
+
+        Only the entry inside ``storage_dir`` is unlinked.  In symlink mode
+        that entry is the link, so the original file it points at is left
+        alone; callers that want the original gone must move it themselves.
+
+        Args:
+            variant_id: Primary key in ``image_variants``.
+
+        Returns:
+            The record as it was before deletion, or ``None`` if no variant
+            has that id.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM image_variants WHERE id = ?", (variant_id,)
+        ).fetchone()
+        if row is None:
+            return None
+
+        record = self._to_variant_record(row)
+        self._unlink_entry(record.file_path)
+        self._conn.execute("DELETE FROM image_variants WHERE id = ?", (variant_id,))
+        self._conn.commit()
+        return record
+
+    def delete_canonical(
+        self, canonical_id: int
+    ) -> tuple[ImageRecord, list[VariantRecord]] | None:
+        """Delete a canonical, every variant matched to it, and their files.
+
+        The variants go too because they exist only as relatives of this
+        image; leaving them would strand rows pointing at a canonical that is
+        no longer there.  As with :meth:`delete_variant`, only entries inside
+        ``storage_dir`` are unlinked.
+
+        Args:
+            canonical_id: Primary key in ``images``.
+
+        Returns:
+            ``(canonical, variants)`` as they were before deletion, or ``None``
+            if no canonical has that id.
+        """
+        record = self.get_canonical(canonical_id)
+        if record is None:
+            return None
+
+        variants = self.get_variants_for_canonical(canonical_id)
+        for variant in variants:
+            self._unlink_entry(variant.file_path)
+        self._unlink_entry(record.file_path)
+
+        self._conn.execute(
+            "DELETE FROM image_variants WHERE canonical_id = ?", (canonical_id,)
+        )
+        self._conn.execute("DELETE FROM images WHERE id = ?", (canonical_id,))
+        self._conn.commit()
+        self.invalidate_phash_index()
+        return record, variants
+
+    def promote_variant(self, variant_id: int) -> int | None:
+        """Turn a variant into a canonical image in its own right.
+
+        For a match made in error: two pictures whose pHashes land within the
+        threshold but which are not the same image.  The managed entry moves
+        from ``variants/`` to ``canonicals/`` and the row moves with it,
+        carrying the hashes and dimensions already recorded, so nothing is
+        re-read or re-hashed.
+
+        The promoted image joins the pHash index, so later images can match
+        against it — which is the point, since it represents a picture the
+        index did not previously know about.
+
+        Args:
+            variant_id: Primary key in ``image_variants``.
+
+        Returns:
+            The new canonical's id, or ``None`` if no variant has that id.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM image_variants WHERE id = ?", (variant_id,)
+        ).fetchone()
+        if row is None:
+            return None
+
+        record = self._to_variant_record(row)
+        # Name the destination from the original filename, not from the store
+        # entry, whose stem already carries a hash suffix.
+        dest = self._unique_dest(
+            self._canonicals_dir, Path(record.filename), record.crypto_hash
+        )
+        if record.file_path.exists() or record.file_path.is_symlink():
+            # Same directory tree, so this relocates the entry itself -- in
+            # symlink mode the link rather than its target.
+            os.replace(record.file_path, dest)
+
+        cursor = self._conn.execute(
+            """
+            INSERT INTO images
+                (file_path, filename, width, height, format, crypto_hash, phash, file_size)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(dest),
+                record.filename,
+                record.width,
+                record.height,
+                record.format,
+                record.crypto_hash,
+                record.phash,
+                record.file_size,
+            ),
+        )
+        self._conn.execute("DELETE FROM image_variants WHERE id = ?", (variant_id,))
+        self._conn.commit()
+
+        canonical_id = cursor.lastrowid
+        if self._phash_index is not None:
+            self._phash_index.add(canonical_id, phash_from_str(record.phash))
+        return canonical_id  # type: ignore[return-value]
+
+    @staticmethod
+    def _unlink_entry(path: Path) -> None:
+        """Remove a managed store entry, tolerating one that is already gone.
+
+        ``unlink`` acts on the link rather than its target, so a symlink entry
+        -- broken or not -- is removed without touching the original file.
+        """
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     # ------------------------------------------------------------------
     # Lifecycle
