@@ -312,3 +312,30 @@ class TestPromoteVariant:
         store.get_variants_for_canonical(canonical_id)[0].file_path.unlink()
 
         assert store.promote_variant(variant_id) is not None
+
+
+class TestGetVariant:
+    def test_returns_none_for_an_unknown_id(self, store: ImageStore):
+        assert store.get_variant(9999) is None
+
+    def test_fetches_a_variant_without_knowing_its_canonical(
+        self, store: ImageStore, tmp_path: Path
+    ):
+        canonical_id = add_canonical(store, tmp_path / "a.png")
+        variant_id = add_variant(store, tmp_path / "b.png", canonical_id)
+
+        record = store.get_variant(variant_id)
+
+        assert record is not None
+        assert record.id == variant_id
+        assert record.canonical_id == canonical_id
+
+    def test_matches_what_the_canonical_lookup_returns(
+        self, store: ImageStore, tmp_path: Path
+    ):
+        canonical_id = add_canonical(store, tmp_path / "a.png")
+        variant_id = add_variant(store, tmp_path / "b.png", canonical_id)
+
+        assert store.get_variant(variant_id) == store.get_variants_for_canonical(
+            canonical_id
+        )[0]

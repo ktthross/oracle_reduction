@@ -136,6 +136,17 @@ class ImageStore:
         ).fetchone()
         return self._to_image_record(row) if row else None
 
+    def get_variant(self, variant_id: int) -> VariantRecord | None:
+        """Fetch a variant record by primary key.
+
+        Variants were previously reachable only through their canonical, which
+        is no help to a caller acting on one variant it already has the id of.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM image_variants WHERE id = ?", (variant_id,)
+        ).fetchone()
+        return self._to_variant_record(row) if row else None
+
     def get_variants_for_canonical(self, canonical_id: int) -> list[VariantRecord]:
         """Return all variant records linked to *canonical_id*."""
         rows = self._conn.execute(
