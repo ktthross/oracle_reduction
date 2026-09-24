@@ -89,9 +89,28 @@ class ImageStore:
         self._variants_dir.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path))
         self._conn.row_factory = sqlite3.Row
+        self._configure(self._conn)
         self._conn.executescript(_DDL)
         self._conn.commit()
         self._phash_index: PHashIndex | None = None
+
+    @staticmethod
+    def _configure(conn: sqlite3.Connection) -> None:
+        """Set the pragmas that let a reader and the writer coexist.
+
+        The default rollback journal takes an exclusive lock for the length of
+        a write, so anything reading the store -- a gallery being browsed, a
+        second CLI command -- fails outright while a scan is running.  WAL
+        lets readers carry on against the last committed state instead, which
+        is the whole difference between "browse while it ingests" and
+        "database is locked".
+
+        WAL is a property of the file and persists; ``busy_timeout`` is
+        per-connection, and covers the case WAL does not -- two writers
+        colliding -- by waiting rather than failing on the spot.
+        """
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
 
     # ------------------------------------------------------------------
     # Lookups
