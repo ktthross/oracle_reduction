@@ -116,17 +116,31 @@ class ImageStore:
     # Lookups
     # ------------------------------------------------------------------
 
-    def crypto_hash_exists(self, crypto_hash: str) -> bool:
-        """Return True if *crypto_hash* appears in either table."""
+    def find_by_crypto_hash(
+        self, crypto_hash: str
+    ) -> ImageRecord | VariantRecord | None:
+        """The stored image whose pixels hash to *crypto_hash*, if any.
+
+        Canonicals are searched first, then variants; the hash is unique
+        within each table, and an image cannot be both.  Callers that only
+        need a yes/no want :meth:`crypto_hash_exists`, but anyone about to
+        act on the duplicate -- to delete the copy it duplicates, say --
+        needs the record itself, to check that the copy being kept is
+        actually still there.
+        """
         row = self._conn.execute(
-            "SELECT 1 FROM images WHERE crypto_hash = ?", (crypto_hash,)
+            "SELECT * FROM images WHERE crypto_hash = ?", (crypto_hash,)
         ).fetchone()
         if row:
-            return True
+            return self._to_image_record(row)
         row = self._conn.execute(
-            "SELECT 1 FROM image_variants WHERE crypto_hash = ?", (crypto_hash,)
+            "SELECT * FROM image_variants WHERE crypto_hash = ?", (crypto_hash,)
         ).fetchone()
-        return row is not None
+        return self._to_variant_record(row) if row else None
+
+    def crypto_hash_exists(self, crypto_hash: str) -> bool:
+        """Return True if *crypto_hash* appears in either table."""
+        return self.find_by_crypto_hash(crypto_hash) is not None
 
     def get_all_canonical_phashes(self) -> list[tuple[int, str]]:
         """Return ``[(id, phash_str), ...]`` for every canonical image."""

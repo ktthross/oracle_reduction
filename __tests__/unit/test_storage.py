@@ -84,6 +84,65 @@ class TestCryptoHashExists:
 
 
 # ---------------------------------------------------------------------------
+# find_by_crypto_hash
+# ---------------------------------------------------------------------------
+
+
+class TestFindByCryptoHash:
+    def test_returns_none_when_absent(self, store: ImageStore, image_file):
+        img, _ = image_file
+        assert store.find_by_crypto_hash(compute_crypto_hash(img)) is None
+
+    def test_finds_a_canonical(self, store: ImageStore, image_file):
+        img, path = image_file
+        h = compute_crypto_hash(img)
+        canonical_id = store.save_canonical(img, path, h, compute_phash(img))
+
+        found = store.find_by_crypto_hash(h)
+        assert found is not None
+        assert found.id == canonical_id
+        # The file path is the point: a caller deleting the duplicate has to
+        # be able to check that the copy being kept is still on disk.
+        assert Path(found.file_path).exists()
+
+    def test_finds_a_variant(self, store: ImageStore, tmp_path: Path):
+        orig = make_gradient(256, 256)
+        orig_path = save_image(orig, tmp_path / "orig.png")
+        h_orig = compute_crypto_hash(orig)
+        canonical_id = store.save_canonical(
+            orig, orig_path, h_orig, compute_phash(orig)
+        )
+        canonical = store.get_canonical(canonical_id)
+
+        half = orig.resize((128, 128), Image.LANCZOS)
+        half_path = save_image(half, tmp_path / "half.png")
+        h_half = compute_crypto_hash(half)
+        variant_id = store.save_variant(
+            half, half_path, canonical_id, h_half, compute_phash(half), canonical
+        )
+
+        found = store.find_by_crypto_hash(h_half)
+        assert found is not None
+        assert found.id == variant_id
+        assert found.canonical_id == canonical_id
+        assert Path(found.file_path).exists()
+
+    def test_a_canonical_is_preferred_over_a_variant(
+        self, store: ImageStore, image_file
+    ):
+        """The same pixels cannot be filed twice, so the tables cannot collide.
+
+        Pinned because the lookup searches canonicals first and returns early:
+        if that order ever stopped mattering it should be because the schema
+        changed, not by accident.
+        """
+        img, path = image_file
+        h = compute_crypto_hash(img)
+        canonical_id = store.save_canonical(img, path, h, compute_phash(img))
+        assert store.find_by_crypto_hash(h).id == canonical_id
+
+
+# ---------------------------------------------------------------------------
 # get_all_canonical_phashes
 # ---------------------------------------------------------------------------
 
