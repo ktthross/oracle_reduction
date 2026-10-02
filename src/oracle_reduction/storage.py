@@ -266,17 +266,9 @@ class ImageStore:
         width, height = image.size
         fmt = image.format or source_path.suffix.lstrip(".").upper() or "UNKNOWN"
 
-        canonical_pixels = canonical.width * canonical.height
-        variant_pixels = width * height
-        if variant_pixels > canonical_pixels:
-            relationship = "upscaled"
-            scale_factor = (variant_pixels / canonical_pixels) ** 0.5
-        elif variant_pixels < canonical_pixels:
-            relationship = "downscaled"
-            scale_factor = (variant_pixels / canonical_pixels) ** 0.5
-        else:
-            relationship = "same_resolution"
-            scale_factor = 1.0
+        relationship, scale_factor = self._compare_sizes(
+            canonical.width * canonical.height, width * height
+        )
 
         cursor = self._conn.execute(
             """
@@ -522,6 +514,148 @@ class ImageStore:
         if self._phash_index is not None:
             self._phash_index.add(canonical_id, phash_from_str(record.phash))
         return canonical_id  # type: ignore[return-value]
+
+    def make_canonical(self, variant_id: int) -> tuple[int, int] | None:
+        """Swap a variant with the canonical it belongs to.
+
+        The canonical is whichever copy was *seen first*, which has nothing to
+        do with which copy is best.  A 400px thumbnail scanned before the
+        4000px original becomes the image the gallery shows and the one every
+        later copy is measured against; this trades their places without
+        removing either.
+
+        Everything about the group survives the swap -- the siblings stay
+        siblings, now measured against their new canonical, and both files stay
+        in the store.  Nothing is re-read or re-hashed: the rows already carry
+        the hashes and dimensions, and the managed entries only move between
+        ``canonicals/`` and ``variants/``.
+
+        Args:
+            variant_id: The duplicate to raise.  Its canonical is found from
+                the row, so the caller does not have to agree about which
+                group it belongs to.
+
+        Returns:
+            ``(new_canonical_id, new_variant_id)`` -- the raised image's id in
+            ``images`` and the deposed canonical's id in ``image_variants`` --
+            or ``None`` if no variant has that id, or its canonical has gone.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM image_variants WHERE id = ?", (variant_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        rising = self._to_variant_record(row)
+
+        row = self._conn.execute(
+            "SELECT * FROM images WHERE id = ?", (rising.canonical_id,)
+        ).fetchone()
+        if row is None:  # pragma: no cover - a variant without its canonical
+            return None
+        falling = self._to_image_record(row)
+
+        rising_dest = self._unique_dest(
+            self._canonicals_dir, Path(rising.filename), rising.crypto_hash
+        )
+        falling_dest = self._unique_dest(
+            self._variants_dir, Path(falling.filename), falling.crypto_hash
+        )
+
+        # The database is moved as one transaction; the two files are moved
+        # first because a failed rename must not leave rows describing a
+        # layout the disk does not have.
+        self._relocate(rising.file_path, rising_dest)
+        try:
+            self._relocate(falling.file_path, falling_dest)
+        except OSError:
+            self._relocate(rising_dest, rising.file_path)
+            raise
+
+        rising_pixels = rising.width * rising.height
+        relationship, scale_factor = self._compare_sizes(
+            rising_pixels, falling.width * falling.height
+        )
+
+        with self._conn:
+            cursor = self._conn.execute(
+                """
+                INSERT INTO images
+                    (file_path, filename, width, height, format, crypto_hash,
+                     phash, file_size, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(rising_dest), rising.filename, rising.width, rising.height,
+                    rising.format, rising.crypto_hash, rising.phash,
+                    rising.file_size, rising.created_at,
+                ),
+            )
+            new_canonical_id = cursor.lastrowid
+
+            cursor = self._conn.execute(
+                """
+                INSERT INTO image_variants
+                    (canonical_id, file_path, filename, width, height, format,
+                     crypto_hash, phash, file_size, scale_factor, relationship,
+                     created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    new_canonical_id, str(falling_dest), falling.filename,
+                    falling.width, falling.height, falling.format,
+                    falling.crypto_hash, falling.phash, falling.file_size,
+                    scale_factor, relationship, falling.created_at,
+                ),
+            )
+            new_variant_id = cursor.lastrowid
+
+            # Before the old canonical's row goes, not after: its variants
+            # reference it, and under ON DELETE CASCADE they would go with it.
+            for sibling in self._conn.execute(
+                "SELECT id, width, height FROM image_variants "
+                "WHERE canonical_id = ? AND id != ?",
+                (falling.id, variant_id),
+            ).fetchall():
+                rel, scale = self._compare_sizes(
+                    rising_pixels, sibling["width"] * sibling["height"]
+                )
+                self._conn.execute(
+                    "UPDATE image_variants SET canonical_id = ?, relationship = ?, "
+                    "scale_factor = ? WHERE id = ?",
+                    (new_canonical_id, rel, scale, sibling["id"]),
+                )
+
+            self._conn.execute(
+                "DELETE FROM image_variants WHERE id = ?", (variant_id,)
+            )
+            self._conn.execute("DELETE FROM images WHERE id = ?", (falling.id,))
+
+        # One canonical left the set and another joined it, so the cached
+        # index no longer describes the collection.
+        self.invalidate_phash_index()
+        return new_canonical_id, new_variant_id
+
+    @staticmethod
+    def _compare_sizes(
+        canonical_pixels: int, other_pixels: int
+    ) -> tuple[str, float]:
+        """How *other_pixels* relates to a canonical of *canonical_pixels*.
+
+        Shared by ingest and by :meth:`make_canonical`, which has to restate
+        every sibling's relationship once the canonical underneath them
+        changes.
+        """
+        if other_pixels > canonical_pixels:
+            return "upscaled", (other_pixels / canonical_pixels) ** 0.5
+        if other_pixels < canonical_pixels:
+            return "downscaled", (other_pixels / canonical_pixels) ** 0.5
+        return "same_resolution", 1.0
+
+    @staticmethod
+    def _relocate(entry: Path, dest: Path) -> None:
+        """Move a managed store entry, link and all, if it is still there."""
+        if entry.exists() or entry.is_symlink():
+            os.replace(entry, dest)
 
     @staticmethod
     def _unlink_entry(path: Path) -> None:
