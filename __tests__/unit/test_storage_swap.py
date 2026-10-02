@@ -70,6 +70,36 @@ def group(store: ImageStore, tmp_path: Path):
     return canonical_id, big_id, mid_id
 
 
+def test_it_finds_the_group_needing_a_swap(store: ImageStore, group):
+    canonical_id, big_id, _ = group
+    assert store.variants_beating_their_canonical() == [(canonical_id, big_id)], (
+        "one row per group, naming the biggest copy rather than every bigger one"
+    )
+
+
+def test_nothing_to_do_once_the_biggest_is_canonical(store: ImageStore, group):
+    _, big_id, _ = group
+    store.make_canonical(big_id)
+    assert store.variants_beating_their_canonical() == []
+
+
+def test_a_group_already_in_order_is_not_offered(store: ImageStore, tmp_path: Path):
+    sources = tmp_path / "s"
+    sources.mkdir()
+    base = make_pattern(600, 600, seed=11)
+    canonical_id = store.save_canonical(
+        base, save(base, sources / "big.png"),
+        compute_crypto_hash(base), compute_phash(base),
+    )
+    small = base.resize((100, 100))
+    store.save_variant(
+        small, save(small, sources / "small.png"), canonical_id,
+        compute_crypto_hash(small), compute_phash(small),
+        store.get_canonical(canonical_id),
+    )
+    assert store.variants_beating_their_canonical() == []
+
+
 def test_the_big_copy_becomes_the_canonical(store: ImageStore, group):
     canonical_id, big_id, _ = group
     new_canonical_id, _ = store.make_canonical(big_id)

@@ -515,6 +515,31 @@ class ImageStore:
             self._phash_index.add(canonical_id, phash_from_str(record.phash))
         return canonical_id  # type: ignore[return-value]
 
+    def variants_beating_their_canonical(self) -> list[tuple[int, int]]:
+        """``[(canonical_id, variant_id), ...]`` where a copy has more pixels.
+
+        One row per group: the copy worth raising, which is the largest, then
+        the largest file among equals, then the lowest id -- so the answer is
+        the same every time it is asked.  Groups whose canonical is already the
+        biggest are absent, so an empty list means there is nothing to do.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT v.canonical_id, v.id
+            FROM image_variants v
+            JOIN images i ON i.id = v.canonical_id
+            WHERE v.width * v.height > i.width * i.height
+            ORDER BY v.canonical_id,
+                     v.width * v.height DESC,
+                     COALESCE(v.file_size, 0) DESC,
+                     v.id ASC
+            """
+        ).fetchall()
+        best: dict[int, int] = {}
+        for row in rows:
+            best.setdefault(row["canonical_id"], row["id"])
+        return list(best.items())
+
     def make_canonical(self, variant_id: int) -> tuple[int, int] | None:
         """Swap a variant with the canonical it belongs to.
 
